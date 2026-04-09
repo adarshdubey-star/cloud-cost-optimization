@@ -107,109 +107,144 @@ We build an end-to-end ML pipeline for cloud cost optimization with four integra
 | RL Environment | Custom Gym-style environment | Autoscaling simulation |
 | Data Processing | pandas, NumPy | ETL and feature engineering |
 | Visualization | matplotlib, seaborn | Plots and architecture diagrams |
-| Cloud Platform | **AWS** (EC2, CloudWatch, Auto Scaling Groups) | Target deployment platform |
-| Infrastructure as Code | **Terraform** | Automated provisioning of AWS resources |
-| Container Orchestration | **Kubernetes (EKS)** | Workload deployment and pod autoscaling |
-| Monitoring | **AWS CloudWatch** + **Prometheus/Grafana** | Metrics collection and dashboards |
-| ML Model Serving | **AWS SageMaker** | Model training and real-time inference endpoint |
-| Data Storage | **Amazon S3** + **Amazon Timestream** | Raw data lake + time-series metrics DB |
-| Serverless | **AWS Lambda** | Lightweight event-driven scaling triggers |
+| Cloud Platform | **Google Cloud Platform (GCP)** | Compute Engine, Cloud Monitoring, Cloud Storage |
+| Infrastructure as Code | **Terraform** | Automated provisioning of all GCP resources |
+| Monitoring | **GCP Cloud Monitoring** (Ops Agent) | Real-time CPU, memory, disk, network metrics |
+| Compute | **GCP Compute Engine — Managed Instance Groups (MIG)** | Autoscaled VM fleet |
+| Storage | **Google Cloud Storage (GCS)** | Model artifacts and workload data |
+| Alerting | **GCP Cloud Monitoring Alert Policies** | SLA violation detection |
 
-### 4.3 Cloud Platform Architecture (AWS)
+### 4.3 Cloud Platform Architecture (GCP)
 
-The solution is designed for deployment on **Amazon Web Services (AWS)** using the following services:
+The solution is deployed on **Google Cloud Platform (GCP)** using the following services:
 
-#### Step 1: Data Collection Layer
-- **AWS CloudWatch** collects real-time metrics (CPU, memory, disk I/O, network) from EC2 instances at 5-minute intervals via the CloudWatch Agent.
-- **Amazon Timestream** stores the time-series metrics for fast queries. Historical data is also archived in **Amazon S3** as Parquet files for batch model retraining.
-- In our prototype, we simulate this layer using a synthetic data generator (`src/data_generator.py`) that produces realistic workload patterns matching CloudWatch metric distributions.
+#### Step 1: Infrastructure Provisioning (Terraform)
 
-#### Step 2: ML Training Pipeline
-- **AWS SageMaker** is used for training the ML models at scale. SageMaker Training Jobs run the supervised models (Linear Regression, Random Forest, Gradient Boosting) and the LSTM deep learning model on GPU instances (`ml.g4dn.xlarge`).
-- Models are stored in **Amazon S3** as versioned artifacts and served via **SageMaker Endpoints** for real-time inference.
-- Model retraining is scheduled weekly via **Amazon EventBridge** to adapt to workload drift.
-- In our prototype, training runs locally using scikit-learn and TensorFlow.
-
-#### Step 3: Autoscaling Decision Engine
-- The trained forecasting model (best: LSTM) runs as a **SageMaker real-time inference endpoint** that receives current workload features and returns predicted CPU demand for the next 1–6 hours.
-- The **RL Autoscaler** (Q-Learning agent) runs as an **AWS Lambda function** triggered every 5 minutes by an EventBridge schedule. It:
-  1. Queries CloudWatch for current metrics
-  2. Calls the SageMaker endpoint for demand forecast
-  3. Determines the optimal scaling action (add/remove/keep instances)
-  4. Sends the scaling command to the EC2 Auto Scaling Group API
-
-#### Step 4: Resource Scaling Execution
-- **EC2 Auto Scaling Groups (ASG)** manage the fleet of VM instances. The ASG is configured with:
-  - Minimum: 1 instance, Maximum: 20 instances
-  - The RL agent's decisions override the default scaling policies via `SetDesiredCapacity` API calls
-- **Amazon EKS (Elastic Kubernetes Service)** is used for containerized workloads, with the **Kubernetes Horizontal Pod Autoscaler (HPA)** supplementing the RL agent's decisions at the pod level.
-- **EC2 Spot Instances** are leveraged for cost savings on fault-tolerant batch workloads, with the ML model predicting optimal spot bid prices based on historical spot pricing data.
-
-#### Step 5: Monitoring and Feedback Loop
-- **Amazon CloudWatch Dashboards** display real-time cost, utilization, and instance count metrics.
-- **CloudWatch Alarms** trigger SNS notifications when SLA violations (CPU > capacity) occur.
-- **Prometheus + Grafana** (running on EKS) provide detailed application-level metrics and custom dashboards for the ML optimization pipeline.
-- All scaling decisions and outcomes are logged back to S3/Timestream, creating a feedback loop for continuous model improvement.
-
-#### Infrastructure as Code (Terraform)
-
-The entire AWS infrastructure is provisioned using **Terraform**, including:
+All GCP resources are provisioned using **Terraform** (`terraform/main.tf`):
 
 ```hcl
-# Key Terraform resources:
-resource "aws_autoscaling_group" "workload_asg" {
-  min_size         = 1
-  max_size         = 20
-  desired_capacity = 2
-  launch_template  { ... }  # EC2 instance configuration
+# Managed Instance Group — autoscaled VM fleet
+resource "google_compute_instance_group_manager" "workload_mig" {
+  name               = "workload-mig"
+  base_instance_name = "workload"
+  zone               = "us-central1-a"
+  target_size        = 1
 }
 
-resource "aws_sagemaker_endpoint" "forecast_model" {
-  endpoint_config_name = aws_sagemaker_endpoint_configuration.config.name
-}
-
-resource "aws_lambda_function" "rl_autoscaler" {
-  function_name = "rl-autoscaler"
-  runtime       = "python3.12"
-  handler       = "lambda_handler.handler"
-  timeout       = 30
-  environment {
-    variables = {
-      SAGEMAKER_ENDPOINT = aws_sagemaker_endpoint.forecast_model.name
-      ASG_NAME           = aws_autoscaling_group.workload_asg.name
-    }
+# GCP Autoscaler — baseline threshold-based (for comparison)
+resource "google_compute_autoscaler" "threshold_autoscaler" {
+  autoscaling_policy {
+    min_replicas    = 1
+    max_replicas    = 10
+    cpu_utilization { target = 0.70 }
   }
 }
 
-resource "aws_cloudwatch_event_rule" "every_5_min" {
-  schedule_expression = "rate(5 minutes)"
-}
+# Cloud Storage — model artifacts and data
+resource "google_storage_bucket" "ml_bucket" { ... }
 
-resource "aws_eks_cluster" "workload_cluster" {
-  name     = "cloud-opt-cluster"
-  role_arn = aws_iam_role.eks_role.arn
-  vpc_config { ... }
+# Monitoring alert — SLA violation detection
+resource "google_monitoring_alert_policy" "high_cpu" {
+  conditions {
+    condition_threshold {
+      filter          = "metric.type = \"compute.googleapis.com/instance/cpu/utilization\""
+      threshold_value = 0.85
+    }
+  }
 }
 ```
 
-### 4.4 Dataset
+The Terraform configuration creates:
+- A **VPC network** with firewall rules for SSH and HTTP
+- An **Instance Template** with Debian 12, Ops Agent, stress-ng, and nginx pre-installed via startup script
+- A **Managed Instance Group** (1–10 instances) with a baseline CPU-based autoscaler
+- A **GCS bucket** for storing model artifacts
+- A **Cloud Monitoring Alert Policy** for SLA violations (CPU > 85%)
 
-We generate a synthetic dataset of **25,920 records** spanning **90 days** at **5-minute intervals** (matching AWS CloudWatch default resolution), containing:
+#### Step 2: Data Collection Layer
+- **GCP Cloud Monitoring** (formerly Stackdriver) collects real-time metrics from Compute Engine instances via the **Google Ops Agent** installed on each VM.
+- Metrics collected: `compute.googleapis.com/instance/cpu/utilization`, `agent.googleapis.com/memory/percent_used`, disk read/write bytes, network received/sent bytes.
+- The Python module `src/gcp_metrics.py` uses the **Cloud Monitoring API** (`google-cloud-monitoring` library) to query these metrics at 5-minute aligned intervals.
+- Historical metrics are stored in **Google Cloud Storage** as CSV files for batch model retraining.
+
+#### Step 3: Workload Simulation
+- A **load generator script** (`scripts/generate_load.sh`) uses `gcloud compute ssh` to run **stress-ng** on MIG instances with varying CPU load levels.
+- The script simulates a realistic diurnal pattern across 6 phases: off-peak (20%) → ramp-up (50%) → peak (80%) → spike (95%) → decline (60%) → recovery (25%).
+- This generates real Cloud Monitoring data that the ML pipeline trains on.
+
+#### Step 4: ML Training Pipeline
+- ML models are trained on the metrics collected from GCP Cloud Monitoring.
+- Five forecasting models: Linear Regression, Random Forest, Gradient Boosting, ARIMA, LSTM.
+- K-Means clustering classifies workload intervals into profiles (Low, Medium, High, Spike).
+- The trained RL agent's Q-table is saved to `results/rl_qtable.npy` for use in live autoscaling.
+
+#### Step 5: Autoscaling Decision Engine
+- The **ML/RL autoscaler** (`src/gcp_autoscaler.py`) runs as a control loop that:
+  1. Queries **Cloud Monitoring API** for current CPU/memory/network metrics
+  2. Uses the trained ML model to forecast demand, or the RL agent to decide an action
+  3. Calls the **Compute Engine API** (`google-cloud-compute` library) to resize the MIG via `InstanceGroupManagersClient.resize()`
+  4. Logs every decision with timestamp, instance count, cost rate, and CPU utilization
+
+- Three strategies are compared on the live GCP infrastructure:
+
+| Strategy | How It Works on GCP |
+|----------|---------------------|
+| **Threshold-Based** | GCP's native `google_compute_autoscaler` with CPU target = 70% |
+| **ML-Predicted** | Python calls `resize()` API based on Gradient Boosting/LSTM forecast + 10% headroom |
+| **RL-Optimized** | Python calls `resize()` API based on Q-Learning agent's greedy action |
+
+#### Step 6: Monitoring and Feedback
+- **GCP Cloud Monitoring Dashboards** display real-time CPU, memory, instance count, and cost metrics.
+- **Alert Policies** send notifications when SLA violations occur (CPU > 85% sustained for 5 minutes).
+- All scaling decisions are logged to CSV files in `results/`, creating a feedback loop for model retraining.
+
+### 4.4 GCP Setup and Deployment Steps
+
+```bash
+# 1. Authenticate with GCP
+gcloud auth login
+gcloud config set project YOUR_PROJECT_ID
+
+# 2. Run automated setup (enables APIs, creates service account, inits Terraform)
+./scripts/setup_gcp.sh YOUR_PROJECT_ID
+
+# 3. Deploy infrastructure
+cd terraform && terraform apply
+
+# 4. Generate workload on VMs (runs stress-ng with varying load)
+./scripts/generate_load.sh YOUR_PROJECT_ID us-central1-a workload-mig 30
+
+# 5. Collect real metrics from Cloud Monitoring
+python main.py --mode gcp-collect --project YOUR_PROJECT_ID --hours 1
+
+# 6. Run full pipeline: train models + live autoscaling
+python main.py --mode gcp --project YOUR_PROJECT_ID
+
+# 7. Run specific optimization strategy live
+python main.py --mode gcp-optimize --project YOUR_PROJECT_ID --strategy rl --duration 15
+
+# 8. Tear down infrastructure when done
+cd terraform && terraform destroy
+```
+
+### 4.5 Dataset
+
+We generate a synthetic dataset of **25,920 records** spanning **90 days** at **5-minute intervals** (matching GCP Cloud Monitoring default resolution), containing:
 - `cpu_utilization` (%) — with diurnal cycle, weekly seasonality, trend, and random spikes
 - `memory_utilization` (%)
 - `disk_io_mbps` (MB/s)
 - `network_mbps` (Mbps)
 - `request_count` (per interval)
 - `instances_threshold` — baseline allocation using threshold rules
-- `cost_threshold` — baseline cost at $0.05/instance/interval (~$0.60/hr, matching AWS `m5.large` on-demand pricing)
+- `cost_threshold` — baseline cost at $0.05/instance/interval (~$0.034/hr per instance, matching GCP `e2-medium` on-demand pricing)
 
-### 4.5 Feature Engineering
+### 4.6 Feature Engineering
 
 - **Temporal features:** hour, day_of_week, is_weekend, minute_of_day, week_number
 - **Lag features:** CPU at t-1, t-3, t-6, t-12, t-288 (one day lookback)
 - **Rolling statistics:** 1-hour and 1-day rolling mean of CPU utilization
 
-### 4.6 ML Models
+### 4.7 ML Models
 
 #### Supervised Models
 - **Linear Regression** — Baseline model for demand forecasting
@@ -226,24 +261,28 @@ We generate a synthetic dataset of **25,920 records** spanning **90 days** at **
 #### Reinforcement Learning
 - **Q-Learning Agent** — State space: (CPU bucket × instance bucket) = 100 states; 3 actions (remove/keep/add instance); trained for 200 episodes with ε-greedy exploration (ε: 1.0→0.05)
 
-### 4.7 Cost Comparison Framework
+### 4.8 Cost Comparison Framework
 
 Three strategies are compared on identical workload data:
 
-| Strategy | Description | AWS Equivalent |
-|----------|-------------|----------------|
-| **Threshold-Based** | Scale instances = ⌈CPU × 1.5 / 25⌉ (reactive with safety margin) | Default CloudWatch Alarm + ASG Target Tracking |
-| **ML-Predicted** | Scale based on LSTM/Gradient Boosting forecast with 10% headroom | SageMaker Endpoint + Predictive Scaling Policy |
-| **RL-Optimized** | Q-Learning agent dynamically selects scaling action per step | Lambda + Custom RL Policy replacing ASG rules |
+| Strategy | Description | GCP Implementation |
+|----------|-------------|-------------------|
+| **Threshold-Based** | Scale instances = ⌈CPU × 1.5 / 25⌉ (reactive with safety margin) | `google_compute_autoscaler` with CPU target = 70% |
+| **ML-Predicted** | Scale based on LSTM/Gradient Boosting forecast with 10% headroom | Python script calls `resize()` on Compute Engine MIG |
+| **RL-Optimized** | Q-Learning agent dynamically selects scaling action per step | Python script applies RL policy via Compute Engine API |
 
 Metrics: Total cost ($), Resource waste (%), SLA violation rate (%).
 
-### 4.8 How to Run
+### 4.9 How to Run
 
 ```bash
+# Local simulation (trains models on synthetic data)
 cd cloud-cost-optimization
 pip install -r requirements.txt
 python main.py
+
+# GCP live mode (requires GCP project with deployed infrastructure)
+python main.py --mode gcp --project YOUR_PROJECT_ID
 ```
 
 The pipeline generates all data, trains all models, and saves figures + summary JSON to `results/`.
@@ -360,59 +399,68 @@ The project validates the hypothesis that ML-driven, proactive, data-driven reso
 The system architecture is illustrated in the generated diagram (`results/figures/architecture_diagram.png`):
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    DATA COLLECTION LAYER                         │
-│  ┌──────────────────┐    ┌──────────────────────┐               │
-│  │  Cloud Metrics    │───▶│  Historical Workload │               │
-│  │  Collector        │    │  Database (TS Store)  │               │
-│  │  (CPU,Mem,Disk,   │    └──────────┬───────────┘               │
-│  │   Net,Requests)   │               │                           │
-│  └──────────────────┘               ▼                           │
-├─────────────────────────────────────────────────────────────────┤
-│                     ML PIPELINE LAYER                            │
-│  ┌──────────────┐  ┌──────────────┐  ┌─────────┐  ┌──────────┐ │
-│  │ Preprocessing│─▶│  Supervised  │  │  Time-  │  │  K-Means │ │
-│  │ & Feature    │  │  Models (LR, │  │  Series │  │  Workload│ │
-│  │ Engineering  │  │  RF, GBT)    │  │  (ARIMA,│  │  Cluster-│ │
-│  └──────────────┘  └──────┬───────┘  │  LSTM)  │  │  ing     │ │
-│                           │          └────┬────┘  └─────┬────┘ │
-│                           ▼               ▼             ▼       │
-├─────────────────────────────────────────────────────────────────┤
-│                    DECISION ENGINE LAYER                         │
-│  ┌────────────────────┐      ┌───────────────────────────┐      │
-│  │  Demand Forecasting│─────▶│  RL Autoscaler            │      │
-│  │  Engine            │      │  (Q-Learning Agent)       │      │
-│  │  (Best model pred.)│      │  Actions: Scale Up/Down/  │      │
-│  └────────────────────┘      │  Keep                     │      │
-│                              └─────────────┬─────────────┘      │
-│                                            ▼                     │
-├─────────────────────────────────────────────────────────────────┤
-│                    CLOUD PLATFORM LAYER                          │
-│  ┌──────────────────────────────────────────────────────┐       │
-│  │  AWS / Azure / GCP                                    │       │
-│  │  Auto-Scaling Group │ VM Fleet │ Spot Instances       │       │
-│  └──────────────────────────────┬───────────────────────┘       │
-│                                  ▼                               │
-├─────────────────────────────────────────────────────────────────┤
-│                       OUTPUT LAYER                               │
-│  ┌───────────┐   ┌────────────────────┐   ┌─────────────────┐  │
-│  │   Cost    │   │ Optimized Resource  │   │  Performance    │  │
-│  │ Dashboard │   │ Allocation          │   │  Monitoring     │  │
-│  │ & Alerts  │   │                     │   │  & SLA Tracking │  │
-│  └───────────┘   └────────────────────┘   └─────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-         ▲                                              │
-         └──────────── Feedback Loop ◀──────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                  GOOGLE CLOUD PLATFORM (GCP)                         │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │  DATA COLLECTION LAYER                                         │  │
+│  │  ┌──────────────────┐    ┌──────────────────────┐              │  │
+│  │  │  GCP Cloud        │───▶│  Google Cloud Storage │              │  │
+│  │  │  Monitoring        │    │  (Metrics Archive +   │              │  │
+│  │  │  (Ops Agent on    │    │   Model Artifacts)    │              │  │
+│  │  │   Compute Engine) │    └──────────┬────────────┘              │  │
+│  │  └──────────────────┘               │                           │  │
+│  └─────────────────────────────────────┼───────────────────────────┘  │
+│                                        ▼                              │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │  ML PIPELINE LAYER (Python + scikit-learn + TensorFlow)        │  │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌─────────┐  ┌────────┐ │  │
+│  │  │ Preprocessing│─▶│  Supervised  │  │  Time-  │  │ K-Means│ │  │
+│  │  │ & Feature    │  │  Models (LR, │  │  Series │  │ Cluster│ │  │
+│  │  │ Engineering  │  │  RF, GBT)    │  │ (ARIMA, │  │  -ing  │ │  │
+│  │  └──────────────┘  └──────┬───────┘  │  LSTM)  │  └───┬────┘ │  │
+│  │                           ▼          └────┬────┘      ▼      │  │
+│  └───────────────────────────┼───────────────┼───────────┼──────┘  │
+│                              ▼               ▼           ▼         │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │  DECISION ENGINE LAYER                                         │  │
+│  │  ┌────────────────────┐      ┌─────────────────────────────┐  │  │
+│  │  │  Demand Forecasting│─────▶│  RL Autoscaler              │  │  │
+│  │  │  Engine (LSTM)     │      │  (Q-Learning Agent)         │  │  │
+│  │  └────────────────────┘      │  Actions: Scale Up/Down/Keep│  │  │
+│  │                              └──────────────┬──────────────┘  │  │
+│  └─────────────────────────────────────────────┼─────────────────┘  │
+│                                                ▼                     │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │  GCP COMPUTE ENGINE LAYER                                      │  │
+│  │  ┌────────────────────────────────────────────────────────┐   │  │
+│  │  │  Managed Instance Group (MIG)   [Terraform-managed]    │   │  │
+│  │  │  Instance Template: e2-medium | Debian 12 | Ops Agent  │   │  │
+│  │  │  Autoscaler: 1–10 instances | CPU target: 70%          │   │  │
+│  │  │  Compute Engine API: resize() for ML/RL scaling        │   │  │
+│  │  └────────────────────────────────────────────────────────┘   │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+│                                  ▼                                    │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │  MONITORING & OUTPUT LAYER                                     │  │
+│  │  ┌──────────────┐  ┌──────────────────┐  ┌─────────────────┐ │  │
+│  │  │ Cloud Monitor│  │ Optimized Resource│  │ Alert Policies  │ │  │
+│  │  │ Dashboards   │  │ Allocation Logs  │  │ (SLA: CPU>85%) │ │  │
+│  │  └──────────────┘  └──────────────────┘  └─────────────────┘ │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+│         ▲                                              │             │
+│         └──────────── Feedback Loop ◀──────────────────┘             │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-**Components:**
+**Components (GCP Services):**
 
-1. **Data Collection Layer:** CloudWatch/Prometheus metrics are collected at 5-minute intervals and stored in a time-series database.
-2. **ML Pipeline Layer:** Raw metrics flow through preprocessing (feature engineering), then to parallel model pipelines (supervised, time-series, clustering).
-3. **Decision Engine Layer:** The forecasting engine produces demand estimates; the RL autoscaler uses these alongside current state to recommend scaling actions.
-4. **Cloud Platform Layer:** Scaling decisions are executed via cloud provider APIs (e.g., AWS EC2 Auto Scaling Groups).
-5. **Output Layer:** Dashboards, alerts, and monitoring track cost, performance, and SLA compliance.
-6. **Feedback Loop:** Actual outcomes feed back into the data pipeline for continuous model improvement.
+1. **Data Collection Layer:** GCP Cloud Monitoring with Ops Agent collects CPU, memory, disk, and network metrics at 5-minute intervals from Compute Engine VMs. Data is archived in Google Cloud Storage.
+2. **ML Pipeline Layer:** Python-based pipeline using scikit-learn and TensorFlow trains supervised models (LR, RF, GBT), time-series models (ARIMA, LSTM), and K-Means clustering on Cloud Monitoring data.
+3. **Decision Engine Layer:** The LSTM forecasting engine produces demand estimates; the Q-Learning RL agent uses these alongside current state to recommend scaling actions (add/remove/keep instances).
+4. **GCP Compute Engine Layer:** A Terraform-managed Managed Instance Group (MIG) with e2-medium instances. The ML/RL decisions are applied via the Compute Engine API's `resize()` method to adjust instance count.
+5. **Monitoring & Output Layer:** Cloud Monitoring Dashboards display real-time metrics. Alert Policies trigger on SLA violations (CPU > 85%). All scaling decisions are logged for continuous feedback.
+6. **Feedback Loop:** Actual outcomes feed back into Cloud Storage for model retraining and continuous improvement.
 
 A high-resolution programmatic diagram is generated by the code at `results/figures/architecture_diagram.png`.
 
