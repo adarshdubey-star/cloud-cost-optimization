@@ -6,3 +6,9 @@ data/
 results/
 models/
 .DS_Store
+gcp-key.json
+terraform/.terraform/
+terraform/*.tfstate*
+terraform/tfplan
+terraform/terraform.tfvars
+setup_and_push.sh

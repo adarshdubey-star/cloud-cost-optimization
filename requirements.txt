@@ -7,3 +7,7 @@ statsmodels>=0.14.0
 tensorflow>=2.13.0
 gymnasium>=0.29.0
 scipy>=1.11.0
+google-cloud-monitoring>=2.16.0
+google-cloud-compute>=1.14.0
+google-cloud-storage>=2.14.0
+google-auth>=2.23.0
