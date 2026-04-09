@@ -99,35 +99,117 @@ We build an end-to-end ML pipeline for cloud cost optimization with four integra
 
 ### 4.2 Technology Stack
 
-| Component | Technology |
-|-----------|------------|
-| Language | Python 3.10+ |
-| ML Framework | scikit-learn, TensorFlow/Keras |
-| Time-Series | statsmodels (ARIMA) |
-| RL Environment | Custom Gym-style environment |
-| Data Processing | pandas, NumPy |
-| Visualization | matplotlib, seaborn |
-| Cloud Platform (Target) | AWS (EC2 Auto Scaling, CloudWatch) |
-| Infrastructure as Code | Terraform (deployment templates) |
+| Component | Technology | Purpose |
+|-----------|------------|---------|
+| Language | Python 3.10+ | Core development |
+| ML Framework | scikit-learn, TensorFlow/Keras | Supervised, unsupervised, and deep learning models |
+| Time-Series | statsmodels (ARIMA) | Classical statistical forecasting |
+| RL Environment | Custom Gym-style environment | Autoscaling simulation |
+| Data Processing | pandas, NumPy | ETL and feature engineering |
+| Visualization | matplotlib, seaborn | Plots and architecture diagrams |
+| Cloud Platform | **AWS** (EC2, CloudWatch, Auto Scaling Groups) | Target deployment platform |
+| Infrastructure as Code | **Terraform** | Automated provisioning of AWS resources |
+| Container Orchestration | **Kubernetes (EKS)** | Workload deployment and pod autoscaling |
+| Monitoring | **AWS CloudWatch** + **Prometheus/Grafana** | Metrics collection and dashboards |
+| ML Model Serving | **AWS SageMaker** | Model training and real-time inference endpoint |
+| Data Storage | **Amazon S3** + **Amazon Timestream** | Raw data lake + time-series metrics DB |
+| Serverless | **AWS Lambda** | Lightweight event-driven scaling triggers |
 
-### 4.3 Dataset
+### 4.3 Cloud Platform Architecture (AWS)
 
-We generate a synthetic dataset of **25,920 records** spanning **90 days** at **5-minute intervals**, containing:
+The solution is designed for deployment on **Amazon Web Services (AWS)** using the following services:
+
+#### Step 1: Data Collection Layer
+- **AWS CloudWatch** collects real-time metrics (CPU, memory, disk I/O, network) from EC2 instances at 5-minute intervals via the CloudWatch Agent.
+- **Amazon Timestream** stores the time-series metrics for fast queries. Historical data is also archived in **Amazon S3** as Parquet files for batch model retraining.
+- In our prototype, we simulate this layer using a synthetic data generator (`src/data_generator.py`) that produces realistic workload patterns matching CloudWatch metric distributions.
+
+#### Step 2: ML Training Pipeline
+- **AWS SageMaker** is used for training the ML models at scale. SageMaker Training Jobs run the supervised models (Linear Regression, Random Forest, Gradient Boosting) and the LSTM deep learning model on GPU instances (`ml.g4dn.xlarge`).
+- Models are stored in **Amazon S3** as versioned artifacts and served via **SageMaker Endpoints** for real-time inference.
+- Model retraining is scheduled weekly via **Amazon EventBridge** to adapt to workload drift.
+- In our prototype, training runs locally using scikit-learn and TensorFlow.
+
+#### Step 3: Autoscaling Decision Engine
+- The trained forecasting model (best: LSTM) runs as a **SageMaker real-time inference endpoint** that receives current workload features and returns predicted CPU demand for the next 1–6 hours.
+- The **RL Autoscaler** (Q-Learning agent) runs as an **AWS Lambda function** triggered every 5 minutes by an EventBridge schedule. It:
+  1. Queries CloudWatch for current metrics
+  2. Calls the SageMaker endpoint for demand forecast
+  3. Determines the optimal scaling action (add/remove/keep instances)
+  4. Sends the scaling command to the EC2 Auto Scaling Group API
+
+#### Step 4: Resource Scaling Execution
+- **EC2 Auto Scaling Groups (ASG)** manage the fleet of VM instances. The ASG is configured with:
+  - Minimum: 1 instance, Maximum: 20 instances
+  - The RL agent's decisions override the default scaling policies via `SetDesiredCapacity` API calls
+- **Amazon EKS (Elastic Kubernetes Service)** is used for containerized workloads, with the **Kubernetes Horizontal Pod Autoscaler (HPA)** supplementing the RL agent's decisions at the pod level.
+- **EC2 Spot Instances** are leveraged for cost savings on fault-tolerant batch workloads, with the ML model predicting optimal spot bid prices based on historical spot pricing data.
+
+#### Step 5: Monitoring and Feedback Loop
+- **Amazon CloudWatch Dashboards** display real-time cost, utilization, and instance count metrics.
+- **CloudWatch Alarms** trigger SNS notifications when SLA violations (CPU > capacity) occur.
+- **Prometheus + Grafana** (running on EKS) provide detailed application-level metrics and custom dashboards for the ML optimization pipeline.
+- All scaling decisions and outcomes are logged back to S3/Timestream, creating a feedback loop for continuous model improvement.
+
+#### Infrastructure as Code (Terraform)
+
+The entire AWS infrastructure is provisioned using **Terraform**, including:
+
+```hcl
+# Key Terraform resources:
+resource "aws_autoscaling_group" "workload_asg" {
+  min_size         = 1
+  max_size         = 20
+  desired_capacity = 2
+  launch_template  { ... }  # EC2 instance configuration
+}
+
+resource "aws_sagemaker_endpoint" "forecast_model" {
+  endpoint_config_name = aws_sagemaker_endpoint_configuration.config.name
+}
+
+resource "aws_lambda_function" "rl_autoscaler" {
+  function_name = "rl-autoscaler"
+  runtime       = "python3.12"
+  handler       = "lambda_handler.handler"
+  timeout       = 30
+  environment {
+    variables = {
+      SAGEMAKER_ENDPOINT = aws_sagemaker_endpoint.forecast_model.name
+      ASG_NAME           = aws_autoscaling_group.workload_asg.name
+    }
+  }
+}
+
+resource "aws_cloudwatch_event_rule" "every_5_min" {
+  schedule_expression = "rate(5 minutes)"
+}
+
+resource "aws_eks_cluster" "workload_cluster" {
+  name     = "cloud-opt-cluster"
+  role_arn = aws_iam_role.eks_role.arn
+  vpc_config { ... }
+}
+```
+
+### 4.4 Dataset
+
+We generate a synthetic dataset of **25,920 records** spanning **90 days** at **5-minute intervals** (matching AWS CloudWatch default resolution), containing:
 - `cpu_utilization` (%) — with diurnal cycle, weekly seasonality, trend, and random spikes
 - `memory_utilization` (%)
 - `disk_io_mbps` (MB/s)
 - `network_mbps` (Mbps)
 - `request_count` (per interval)
 - `instances_threshold` — baseline allocation using threshold rules
-- `cost_threshold` — baseline cost at $0.05/instance/interval
+- `cost_threshold` — baseline cost at $0.05/instance/interval (~$0.60/hr, matching AWS `m5.large` on-demand pricing)
 
-### 4.4 Feature Engineering
+### 4.5 Feature Engineering
 
 - **Temporal features:** hour, day_of_week, is_weekend, minute_of_day, week_number
 - **Lag features:** CPU at t-1, t-3, t-6, t-12, t-288 (one day lookback)
 - **Rolling statistics:** 1-hour and 1-day rolling mean of CPU utilization
 
-### 4.5 Models
+### 4.6 ML Models
 
 #### Supervised Models
 - **Linear Regression** — Baseline model for demand forecasting
@@ -142,21 +224,21 @@ We generate a synthetic dataset of **25,920 records** spanning **90 days** at **
 - **K-Means** (k=4) — Clusters workload intervals into profiles; optimal k selected via elbow method and silhouette analysis
 
 #### Reinforcement Learning
-- **Q-Learning Agent** — State space: (CPU bucket × instance bucket) = 100 states; 3 actions (remove/keep/add instance); trained for 150 episodes with ε-greedy exploration (ε: 1.0→0.05)
+- **Q-Learning Agent** — State space: (CPU bucket × instance bucket) = 100 states; 3 actions (remove/keep/add instance); trained for 200 episodes with ε-greedy exploration (ε: 1.0→0.05)
 
-### 4.6 Cost Comparison Framework
+### 4.7 Cost Comparison Framework
 
 Three strategies are compared on identical workload data:
 
-| Strategy | Description |
-|----------|-------------|
-| **Threshold-Based** | Scale instances = ⌈CPU / 25⌉ (reactive) |
-| **ML-Predicted** | Scale based on Gradient Boosting forecast with 15% headroom |
-| **RL-Optimized** | Q-Learning agent dynamically selects scaling action per step |
+| Strategy | Description | AWS Equivalent |
+|----------|-------------|----------------|
+| **Threshold-Based** | Scale instances = ⌈CPU × 1.5 / 25⌉ (reactive with safety margin) | Default CloudWatch Alarm + ASG Target Tracking |
+| **ML-Predicted** | Scale based on LSTM/Gradient Boosting forecast with 10% headroom | SageMaker Endpoint + Predictive Scaling Policy |
+| **RL-Optimized** | Q-Learning agent dynamically selects scaling action per step | Lambda + Custom RL Policy replacing ASG rules |
 
 Metrics: Total cost ($), Resource waste (%), SLA violation rate (%).
 
-### 4.7 How to Run
+### 4.8 How to Run
 
 ```bash
 cd cloud-cost-optimization
